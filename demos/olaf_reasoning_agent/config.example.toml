@@ -12,6 +12,10 @@ ontology_id = "demo"
 # LLM as evidence for each fix (default: the server's [qdrant].collection)
 collection = "chunks"
 
+# Seeds the ontology was built with, by id — what include_seeds (below) reasons over, and what the
+# LLM sees. Omit to use every seed loaded in the store; [] to use none.
+# seed_ids = ["fibo-be", "sustaingraph"]
+
 # Optional — payload field names, if this collection differs from the server's [qdrant.field_mapping]
 # [olaf.field_mapping]
 # text        = "text"
@@ -65,7 +69,8 @@ problems_per_task = 5
 # Also connect orphan classes/individuals (no relation to the rest of the ontology)
 fix_orphans = true
 
-# Reason over the seed ontologies too (slower; finds conflicts between the ontology and its seeds)
+# Reason over the seed ontologies too (slower; finds conflicts between the ontology and its seeds).
+# Which seeds: [olaf] seed_ids.
 include_seeds = false
 
 # Max LLM ↔ tool rounds per task — the context is given upfront, searches are for what it misses

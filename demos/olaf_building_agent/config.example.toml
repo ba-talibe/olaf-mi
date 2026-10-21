@@ -15,6 +15,10 @@ base_uri = "http://olaf.local/ontology#"
 # Qdrant collection holding the chunks to process (default: the server's [qdrant].collection)
 collection = "chunks"
 
+# Seeds (reference ontologies) to use, by id (see olaf seed_list / `olaf load-seed`). The agent sees
+# and reuses only their terms. Omit to use every seed loaded in the store; [] to use none.
+# seed_ids = ["fibo-be", "sustaingraph"]
+
 # Optional — payload field names, if this collection differs from the server's [qdrant.field_mapping]
 # [olaf.field_mapping]
 # text        = "text"
@@ -61,9 +65,13 @@ transient_retries = 2
 batch_size  = 5      # chunks per batch — larger = fewer LLM calls but bigger prompts (3–8 is usually good)
 max_batches = 0      # stop after N batches (0 = process all pending chunks) — handy for quick trials
 
-# Max classes / properties / seed classes listed in each batch's ontology digest
+# Max classes / properties listed in each batch's ontology digest
 # (the LLM finds the others with concept_search / property_search).
 digest_max_entries = 150
+# Seed terms listed in each batch's digest: the closest in meaning to the batch's chunks
+# (semantic search), and the seeds' general classes, candidate parents of new classes
+digest_seed_terms   = 30
+digest_seed_parents = 30
 
 # Max LLM ↔ tool rounds per batch
 max_iterations = 30

@@ -61,13 +61,15 @@ def completion(llm_cfg: dict, **kwargs):
     while True:
         try:
             return litellm.completion(**kwargs, **endpoint_kwargs(llm_cfg))
-        except litellm.RateLimitError:
+        except litellm.RateLimitError as exc:
             if rate_limited == rate_limit_retries:
                 raise
             wait = min(15 * 2 ** rate_limited, 60)
             rate_limited += 1
+            # The provider's message says which quota was hit (requests or tokens per minute…).
             logger.warning(
-                "Rate limited by the LLM provider — retrying in %ds (%d/%d).", wait, rate_limited, rate_limit_retries
+                "Rate limited by the LLM provider — retrying in %ds (%d/%d): %s",
+                wait, rate_limited, rate_limit_retries, " ".join(str(exc).split())[:300],
             )
             time.sleep(wait)
         except _TRANSIENT_ERRORS as exc:
@@ -75,7 +77,8 @@ def completion(llm_cfg: dict, **kwargs):
                 raise
             transient += 1
             logger.warning(
-                "LLM call failed (%s) — retrying in 10s (%d/%d).", type(exc).__name__, transient, transient_retries
+                "LLM call failed (%s) — retrying in 10s (%d/%d): %s",
+                type(exc).__name__, transient, transient_retries, " ".join(str(exc).split())[:300],
             )
             time.sleep(10)
 
@@ -131,6 +134,9 @@ def summarise(args: dict) -> str:
     every change can be read (and undone) from the log; long texts are shortened."""
     parts = []
     for k, v in args.items():
+        if isinstance(v, (bool, int, float)) or v is None:  # True, not 'True': the value sent is not a string
+            parts.append(f"{k}={v!r}")
+            continue
         s = " ".join(str(v).split())
         parts.append(f"{k}={s[:120]!r}…" if len(s) > 120 and not s.startswith("http") else f"{k}={s!r}")
     return ", ".join(parts)
@@ -157,7 +163,8 @@ class LoopSettings:
 
 class ToolLoop:
     """The LLM ↔ OLAF tool loop: the LLM calls tools until it replies with plain text.
-    Only the tools in `allowed` can be called; others are refused with `refusal`."""
+    Only the tools in `allowed` can be called; others are refused with `refusal`.
+    `forced_args` ({tool: {arg: value}}) overrides what the LLM passes for those arguments."""
 
     def __init__(
         self,
@@ -169,6 +176,7 @@ class ToolLoop:
         refusal: str = "Error: {tool} is not available for this task.",
         verbose: bool = True,
         before_call: Callable[[str, dict], None] | None = None,
+        forced_args: dict[str, dict] | None = None,
     ):
         self.session = session
         self.llm_cfg = llm_cfg
@@ -178,6 +186,7 @@ class ToolLoop:
         self.refusal = refusal
         self.verbose = verbose  # INFO-level progress (batch agents) vs DEBUG (interactive)
         self.before_call = before_call
+        self.forced_args = forced_args or {}
 
     async def complete(self, messages: list[dict], tool_choice: str = "auto"):
         s = self.settings
@@ -203,6 +212,7 @@ class ToolLoop:
             logger.warning("Refused tool: %s", tool_name)
             return self.refusal.format(tool=tool_name)
 
+        tool_args = {**tool_args, **self.forced_args.get(tool_name, {})}
         logger.info("Tool call: %s(%s)", tool_name, summarise(tool_args))
         if self.before_call:
             self.before_call(tool_name, tool_args)
@@ -278,8 +288,8 @@ async def call_or_exit(session: ClientSession, tool_name: str, args: dict) -> st
 
 async def select_context(session: ClientSession, olaf_cfg: dict, create: bool = False) -> None:
     """Activate the configured ontology — created first if `create` and missing, otherwise it
-    must exist — and select the chunk collection. Session state only: other agents on the
-    same server are unaffected."""
+    must exist — and select the chunk collection and the seeds (`seed_ids`; omitted: every seed
+    in the store, empty: none). Session state only: other agents on the same server are unaffected."""
     ontology_id = olaf_cfg["ontology_id"]
     created = False
     if create:
@@ -299,6 +309,12 @@ async def select_context(session: ClientSession, olaf_cfg: dict, create: bool = 
                     collection, counts.get("chunks_processed", "?"), counts.get("chunks_total", "?"))
     else:
         logger.info("Chunk collection: server default ([qdrant].collection)")
+
+    if (seed_ids := olaf_cfg.get("seed_ids")) is not None:
+        await call_or_exit(session, "seed_select", {"seed_ids": seed_ids})
+        logger.info("Seeds: %s", ", ".join(seed_ids) or "none")
+    else:
+        logger.info("Seeds: all loaded seeds")
 
 
 def setup_logging(level: str) -> None:

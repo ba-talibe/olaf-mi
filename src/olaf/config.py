@@ -1,5 +1,6 @@
 from __future__ import annotations
 import os
+import sys
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -17,7 +18,8 @@ class QdrantConfig:
     url: str = "http://localhost:6333"
     api_key: str | None = None
     collection: str = "chunks"
-    concepts_collection: str = "olaf_concepts"
+    # Prefix of the semantic index collections: {index_prefix}_{ontology_id}, {index_prefix}_seed_{seed_id}
+    index_prefix: str = "olaf_index"
     field_mapping: FieldMapping = field(default_factory=FieldMapping)
 
 
@@ -76,7 +78,10 @@ class Config:
             cfg.qdrant.url = q.get("url", cfg.qdrant.url)
             cfg.qdrant.api_key = q.get("api_key", cfg.qdrant.api_key)
             cfg.qdrant.collection = q.get("collection", cfg.qdrant.collection)
-            cfg.qdrant.concepts_collection = q.get("concepts_collection", cfg.qdrant.concepts_collection)
+            if "concepts_collection" in q and "index_prefix" not in q:
+                print("Warning: [qdrant] concepts_collection is deprecated, rename it to index_prefix "
+                      "(the index holds classes, individuals and properties).", file=sys.stderr)
+            cfg.qdrant.index_prefix = q.get("index_prefix", q.get("concepts_collection", cfg.qdrant.index_prefix))
             if fm := q.get("field_mapping"):
                 cfg.qdrant.field_mapping.text = fm.get("text", cfg.qdrant.field_mapping.text)
                 cfg.qdrant.field_mapping.doc_id = fm.get("doc_id", cfg.qdrant.field_mapping.doc_id)

@@ -22,7 +22,7 @@ url                 = "http://localhost:6333"
 # api_key             = "..."           # required if Qdrant has auth enabled
                                          # (or set the QDRANT_API_KEY env var, which takes precedence)
 collection          = "chunks"          # default chunk collection (agents can switch)
-concepts_collection = "olaf_concepts"   # prefix — actual: olaf_concepts_{ontology_id}
+index_prefix        = "olaf_index"      # semantic index — collections olaf_index_{ontology_id}, olaf_index_seed_{seed_id}
 
 [qdrant.field_mapping]
 # Names of the payload fields in your existing collection.

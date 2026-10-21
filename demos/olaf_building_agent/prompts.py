@@ -35,9 +35,48 @@ of what you did (no tool call) — that reply ends the task.
 - The task message lists the existing classes and properties. Reuse them by their exact URI.
 - For anything not listed there, call `concept_search` (label substring) and/or
   `concept_semantic_search` (vector similarity) before every `concept_create`, and
-  `property_search` before every `property_create`. If a match exists, reuse or extend it.
-- Prefer a seed URI (reference ontology) over creating a new concept; link new concepts to seed
-  concepts via `rdfs:subClassOf` or `owl:equivalentClass`.
+  `property_search` and/or `property_semantic_search` before every `property_create`.
+  If a match exists, reuse or extend it.
+- These searches also cover the seeds (reference ontologies) selected for this run — the pipeline
+  sets `include_seeds` itself: results with a non-null `seed` field come from a seed.
+
+## Reuse seed terms — never duplicate them
+Seeds are reference ontologies. Reusing their terms under their own URI is what makes the
+ontology interoperable. The task message lists the seed terms closest to the chunks and the
+seeds' general classes. For each concept or property you need, compare it with the seed terms:
+- **Same meaning** as a seed term → call `seed_reuse(uri, source_chunk_id)`, then use the seed
+  URI everywhere (`parent_uri`, `class_uri`, `domain_uri`/`range_uri`, `relation_add`).
+  Do not create a local class or property for it, and do not link a local copy with
+  `owl:equivalentClass`.
+- **Narrower meaning** → `seed_reuse` the seed term, then `concept_create` a local class with
+  the seed URI as `parent_uri` (or `property_create` with it as `parent_uri`).
+- **Before every `concept_create`, ask what kind of thing it is** — an organisation, a legal
+  entity, a state, a government body, a loan, a policy, an intervention… — and look for that
+  kind among the general seed classes of the task message, or search for it (e.g.
+  `concept_semantic_search("sovereign state")`, not only the new class's own name). If a seed
+  class is a correct generalisation, `seed_reuse` it and pass it as `parent_uri`: e.g. "Small
+  Island Developing State" ⊂ seed "sovereign state", "Accredited Entity" ⊂ seed "legal entity".
+  Pick the most specific seed class that is still true of every instance.
+- **Check a seed term before reusing it**: call `seed_term_get(uri)` to read its definition,
+  parents and subclasses — a label is not enough ("6T" says nothing; its parents and
+  subclasses tell what it is). Then apply the **is-a test**: is *every* instance of your class,
+  by definition, an instance of the seed class? If not, or if you cannot tell (no definition,
+  unclear context), do not link them. Counter-examples: a project beneficiary is not a
+  "trust beneficiary" (a party to a trust); a climate risk is not a "climate hazard" (the risk
+  results from the hazard); a national adaptation plan is a policy framework, but not one of
+  the "6T" transformations.
+- **A specific, named organisation, state or programme is an individual, not a class**:
+  `individual_create(label="Barbados Water Authority", class_uri=<seed "government body">)`,
+  not a subclass of it.
+- **Only related** (overlapping, not the same, not narrower) → create a local term; do not
+  assert equivalence or subsumption that the meanings do not support.
+- A reused term keeps its source definition: never call `concept_update`/`property_update` on
+  it, nor `relation_add` with it as subject — state the relation from the local entity.
+- If you already created a local duplicate of a seed term, `seed_reuse` the seed term and
+  `concept_merge(keep_uri=<seed URI>, merge_uri=<local URI>)`.
+- Using a seed URI that was not reused yet fails with an error telling you to call `seed_reuse`.
+- Semantic search scores are only comparable to each other — even unrelated entries can score
+  high. Judge a match by its label and definition (domain and range for a property).
 - Never type a URI from memory. Copy the exact `uri` returned by a tool or listed in the task
   message. `relation_add` rejects URIs that don't exist in the ontology.
 - To fix a mistake, use `relation_delete` to remove a wrong triple, `property_update` to change a
@@ -57,7 +96,8 @@ of what you did (no tool call) — that reply ends the task.
 
 ## Efficiency
 - Batch your reasoning: read all the chunks of the task before creating anything.
-- Only call `concept_semantic_search` when a text search alone is inconclusive.
+- Only call `concept_semantic_search` / `property_semantic_search` when a text search alone is
+  inconclusive.
 """
 
 
