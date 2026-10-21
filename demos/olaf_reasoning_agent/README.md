@@ -52,6 +52,7 @@ export ANTHROPIC_API_KEY=sk-ant-...
 url         = "http://localhost:8000/sse"   # OLAF SSE endpoint
 ontology_id = "demo"                        # ontology to repair (must exist)
 collection  = "chunks"                      # chunk collection it was built from (default: server's)
+seed_ids    = ["fibo-be", "sustaingraph"]   # seeds the ontology was built with (omit: all; []: none)
 
 [litellm]
 model       = "claude-sonnet-4-6"
@@ -68,6 +69,8 @@ infer             = true    # then review and materialize the reasoner's inferen
 max_iterations    = 12      # max LLM rounds per task
 log_level         = "INFO"
 ```
+
+`seed_ids` selects the seeds the session sees (`seed_select`): with `include_seeds = true`, the check and the inferences reason over these seeds together with the ontology. The agent does not attach classes to seed classes: its tools don't include `seed_reuse`, and it handles orphans (entities with no relation at all), not classes that merely lack a parent.
 
 See [`config.example.toml`](config.example.toml) for all settings (context size, seeds, retries, backup, export). The `[litellm]` section works as in `olaf_building_agent`, including OpenAI-compatible providers (`api_base` + `api_key_env`).
 

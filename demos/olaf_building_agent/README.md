@@ -12,7 +12,9 @@ LiteLLM   ──API──▶  Claude / OpenAI / Ollama
 
 The code drives the pipeline; the LLM does the ontology work through OLAF tool calls. Each step below is a **fresh LLM conversation**, so the prompt size depends on `batch_size`, not on how far the build has gone — which keeps token usage per call bounded (and within provider rate limits).
 
-1. **Extraction** — pending chunks are processed by batches of `batch_size`. Each batch gets the chunk texts plus a digest of the current ontology (existing classes, properties and seed classes with their URIs), so the LLM reuses them instead of re-creating them. Once the LLM is done, the pipeline marks the chunks processed: an interrupted run resumes where it stopped.
+1. **Extraction** — pending chunks are processed by batches of `batch_size`. Each batch gets the chunk texts plus a digest: the current ontology's classes and properties, so the LLM reuses them instead of re-creating them, and — from the seeds selected by `[olaf] seed_ids` (all loaded seeds if omitted) — the seed terms closest in meaning to the batch's chunks (semantic search with each chunk's text, `digest_seed_terms`) and the seeds' general classes, those with several subclasses (`digest_seed_parents`), candidate parents of new classes. Once the LLM is done, the pipeline marks the chunks processed: an interrupted run resumes where it stopped.
+
+   **Seeds.** The pipeline sets `include_seeds=true` on the LLM's four search tools, whatever the LLM passes. The prompt applies the usual reuse rules (see the root README, *Reusing seed terms*): a seed term with the same meaning is reused under its own URI (`seed_reuse`), not copied into a local one; a narrower notion becomes a local subclass of the seed term — after asking what kind of thing the new class is, reading the seed term with `seed_term_get`, and passing the is-a test (is *every* instance of the class an instance of the seed class?); a specific named organisation, state or programme becomes an individual of the seed class. Without a definition or a clear context, nothing is linked: a missing parent can be added later, a wrong `rdfs:subClassOf` propagates to every inference.
 2. **Export** — the ontology is written to `export_path`.
 
 Curation is not done here: run [`olaf_reasoning_agent`](../olaf_reasoning_agent/) on the ontology once it is built — it merges duplicates, repairs logical problems, adds disjointness and materializes inferences. Export again at its end (its own `export_path`) for the curated version.
@@ -43,6 +45,7 @@ ontology_id   = "demo"                        # ontology to build (created if mi
 ontology_name = "Demo Ontology"
 base_uri      = "http://olaf.local/ontology#" # namespace, used when the ontology is created
 collection    = "chunks"                      # Qdrant collection to process (default: server's)
+seed_ids      = ["fibo-be", "sustaingraph"]   # seeds to use (omit: all loaded seeds; []: none)
 
 [litellm]
 model       = "anthropic/claude-haiku-4-5-20251001"  # or claude-sonnet-4-6, gpt-4o, ollama/llama3…
@@ -53,6 +56,8 @@ temperature = 0
 batch_size     = 5                       # chunks per extraction batch
 max_batches    = 0                       # 0 = all pending chunks
 max_iterations = 30                      # max LLM rounds per task
+digest_seed_terms   = 30                 # seed terms closest to each batch, listed in its digest
+digest_seed_parents = 30                 # seeds' general classes listed (candidate parents)
 export_path    = "ontology_output.ttl"   # Turtle file written at the end of the run
 log_level      = "INFO"                  # DEBUG | INFO | WARNING
 ```

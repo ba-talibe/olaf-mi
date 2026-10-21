@@ -31,7 +31,8 @@ You have READ-ONLY access through the OLAF MCP tools: you cannot (and must not t
    shape (a definition, a list, a count, a comparison, a path between two things, a yes/no…).
 
 2. **Locate the entities**: call `concept_search` (label substring) and `concept_semantic_search` (meaning,
-   synonyms, other languages) in parallel for each key term. Use `property_search` for the relations.
+   synonyms, other languages) in parallel for each key term. Use `property_search` and
+   `property_semantic_search` for the relations.
    Never guess a URI: only use URIs returned by a tool.
 
 3. **Explore the neighbourhood**: `concept_get` for an entity's definition, parents, restrictions and sources;

@@ -2,10 +2,12 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import sys
 from contextlib import asynccontextmanager
 from typing import Any
 
+import jsonschema
 import mcp.types as types
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
@@ -14,7 +16,7 @@ from qdrant_client import QdrantClient
 from .chunks import ChunkStore
 from .config import Config, FieldMapping
 from .embeddings import EmbeddingService, preload_model
-from .ontology import OntologyStore
+from .ontology import RDF_FORMATS, OntologyStore, seed_graph
 from .reasoner import Reasoner
 
 
@@ -35,6 +37,37 @@ async def _preload_embeddings(config: Config) -> None:
         await asyncio.to_thread(preload_model, config.embedding.model)
     except Exception as e:
         print(f"Warning: embeddings disabled ({e})", file=sys.stderr)
+
+
+def _coerce_arguments(arguments: dict, schema: dict | None) -> dict:
+    """LLMs sometimes send scalars as strings ("False", "10"): convert them to the type the
+    tool's input schema declares — otherwise "False" would be taken as true."""
+    properties = (schema or {}).get("properties", {})
+    coerced = dict(arguments)
+    for key, value in arguments.items():
+        if not isinstance(value, str):
+            continue
+        kind, text = properties.get(key, {}).get("type"), value.strip().lower()
+        if kind == "boolean" and text in ("true", "false", "1", "0", "yes", "no"):
+            coerced[key] = text in ("true", "1", "yes")
+        elif kind == "integer" and re.fullmatch(r"-?\d+", text):
+            coerced[key] = int(text)
+    return coerced
+
+
+def _ontology_collection(config: Config, ontology_id: str) -> str:
+    return f"{config.qdrant.index_prefix}_{ontology_id}"
+
+
+def _seed_collection_prefix(config: Config) -> str:
+    return f"{config.qdrant.index_prefix}_seed_"
+
+
+async def _index_seed(onto: OntologyStore, embed: EmbeddingService, config: Config, seed_id: str) -> int:
+    """(Re)build the seed's Qdrant collection from its classes, individuals and properties in Oxigraph."""
+    entities = [{**e, "seed_id": seed_id} for e in await onto.seed_entities(seed_id)]
+    collection = _seed_collection_prefix(config) + seed_id
+    return await asyncio.to_thread(embed.index_collection, collection, entities)
 
 
 async def _make_shared_infra(config: Config) -> tuple[OntologyStore, QdrantClient, ChunkStore]:
@@ -60,25 +93,30 @@ def create_server(
     OntologyStore (stateless) and QdrantClient serve all connections.
     For stdio, create them first with _make_shared_infra and pass them in.
     """
-    # Per-session state: the active ontology context and chunk collection.
+    # Per-session state: the active ontology context, chunk collection and seed selection
+    # (seed_ids None = every seed in the store).
     # Using a dict so the call_tool closure can mutate it without `nonlocal`.
     session: dict[str, Any] = {
         "ontology_id": config.ontology.ontology_id,
         "base_uri": config.ontology.base_uri,
         "chunks": chunks,
+        "seed_ids": None,
     }
 
     embed: EmbeddingService | None = None
     if config.embedding.enabled:
         try:
-            concepts_collection = f"{config.qdrant.concepts_collection}_{config.ontology.ontology_id}"
-            embed = EmbeddingService(config.embedding.model, qdrant, concepts_collection)
+            embed = EmbeddingService(config.embedding.model, qdrant, _ontology_collection(config, config.ontology.ontology_id))
         except Exception as e:
             print(f"Warning: embeddings disabled ({e})", file=sys.stderr)
 
     reasoner: Reasoner | None = None
     if config.reasoner.enabled:
         reasoner = Reasoner(config.reasoner.java, config.reasoner.memory_mb, config.reasoner.timeout_seconds)
+
+    def _index_failed(e: Exception) -> str:
+        print(f"Warning: semantic index not updated ({e})", file=sys.stderr)
+        return f"Ontology updated, but the semantic index (concept/property_semantic_search) was not: {e}"
 
     def _index(action) -> str | None:
         """Update the semantic index. The ontology change is already written at this point,
@@ -87,10 +125,19 @@ def create_server(
             action()
             return None
         except Exception as e:
-            print(f"Warning: semantic index not updated ({e})", file=sys.stderr)
-            return f"Ontology updated, but the semantic index (concept_semantic_search) was not: {e}"
+            return _index_failed(e)
+
+    async def _reindex(uri: str) -> str | None:
+        """Re-index an entity (class, individual or property) from its current state in the ontology."""
+        try:
+            for entry in await onto.ontology_entities(session["ontology_id"], [uri]):
+                embed.upsert_entity(entry)
+            return None
+        except Exception as e:
+            return _index_failed(e)
 
     server = Server("olaf")
+    schemas: dict[str, dict] = {}  # tool name → input schema, filled on the first call
 
     @server.list_tools()
     async def list_tools() -> list[types.Tool]:
@@ -218,7 +265,7 @@ def create_server(
                     "properties": {
                         "label": {"type": "string", "description": "Human-readable class name, e.g. 'Motor Vehicle'"},
                         "definition": {"type": "string", "description": "Natural language definition"},
-                        "parent_uri": {"type": "string", "description": "Parent class URI for rdfs:subClassOf"},
+                        "parent_uri": {"type": "string", "description": "Parent class URI for rdfs:subClassOf. A seed term must be declared with seed_reuse first."},
                         "aliases": {
                             "type": "array",
                             "items": {"type": "string"},
@@ -258,6 +305,11 @@ def create_server(
                     "properties": {
                         "query": {"type": "string"},
                         "top_k": {"type": "integer", "description": "Max results (default: 10)"},
+                        "include_seeds": {
+                            "type": "boolean",
+                            "description": "Also search the selected seed ontologies' (seed_select) classes; each result then has a "
+                                           "'seed' field (seed id, null for the active ontology). Default: false",
+                        },
                     },
                     "required": ["query"],
                 },
@@ -267,13 +319,20 @@ def create_server(
                 description=(
                     "Search for existing concepts by semantic similarity (vector search in Qdrant). "
                     "Finds concepts that are similar in meaning even with different wording. "
-                    "Call alongside concept_search before concept_create to catch near-duplicates."
+                    "Call alongside concept_search before concept_create to catch near-duplicates. "
+                    "Scores are only comparable to each other (with some models, even unrelated "
+                    "concepts score high): judge a match by its label and definition, not by a threshold."
                 ),
                 inputSchema={
                     "type": "object",
                     "properties": {
                         "query": {"type": "string"},
                         "top_k": {"type": "integer", "description": "Max results (default: 10)"},
+                        "include_seeds": {
+                            "type": "boolean",
+                            "description": "Also search the selected seed ontologies' (seed_select) classes and individuals; each result then has a "
+                                           "'seed' field (seed id, null for the active ontology). Default: false",
+                        },
                     },
                     "required": ["query"],
                 },
@@ -312,7 +371,7 @@ def create_server(
                     "type": "object",
                     "properties": {
                         "label": {"type": "string", "description": "Human-readable name, e.g. 'Paris Agreement'"},
-                        "class_uri": {"type": "string", "description": "URI of the owl:Class this individual is an instance of"},
+                        "class_uri": {"type": "string", "description": "URI of the owl:Class this individual is an instance of. A seed term must be declared with seed_reuse first."},
                         "definition": {"type": "string", "description": "Description of this specific individual"},
                         "aliases": {
                             "type": "array",
@@ -329,7 +388,10 @@ def create_server(
                 name="concept_merge",
                 description=(
                     "Merge two concepts: all triples from merge_uri are copied to keep_uri, "
-                    "all references to merge_uri are re-pointed to keep_uri, then merge_uri is deleted."
+                    "all references to merge_uri are re-pointed to keep_uri, then merge_uri is deleted. "
+                    "merge_uri must be the ontology's own. keep_uri may be a reused seed term, to replace a "
+                    "local duplicate of it: then only the references and source chunks are carried over, "
+                    "since the seed term keeps its source definition."
                 ),
                 inputSchema={
                     "type": "object",
@@ -355,7 +417,7 @@ def create_server(
                             "type": "string",
                             "enum": ["object", "datatype"],
                         },
-                        "domain_uri": {"type": "string", "description": "rdfs:domain class URI"},
+                        "domain_uri": {"type": "string", "description": "rdfs:domain class URI. A seed term must be declared with seed_reuse first."},
                         "range_uri": {
                             "type": "string",
                             "description": "rdfs:range class URI (object) or XSD datatype URI (datatype)",
@@ -377,7 +439,7 @@ def create_server(
                     "type": "object",
                     "properties": {
                         "uri": {"type": "string"},
-                        "domain_uri": {"type": "string", "description": "rdfs:domain class URI"},
+                        "domain_uri": {"type": "string", "description": "rdfs:domain class URI. A seed term must be declared with seed_reuse first."},
                         "range_uri": {"type": "string", "description": "rdfs:range class/datatype URI"},
                         "parent_uri": {"type": "string", "description": "rdfs:subPropertyOf URI"},
                     },
@@ -401,6 +463,35 @@ def create_server(
                     "properties": {
                         "query": {"type": "string"},
                         "top_k": {"type": "integer"},
+                        "include_seeds": {
+                            "type": "boolean",
+                            "description": "Also search the selected seed ontologies' (seed_select) properties; each result then has a "
+                                           "'seed' field (seed id, null for the active ontology). Default: false",
+                        },
+                    },
+                    "required": ["query"],
+                },
+            ),
+            types.Tool(
+                name="property_semantic_search",
+                description=(
+                    "Search for existing properties by semantic similarity (vector search in Qdrant on "
+                    "'label (domain → range)'). Finds properties similar in meaning even with different "
+                    "wording, e.g. 'is equipped with' for 'has engine'. Call alongside property_search "
+                    "before property_create to catch near-duplicates, and with include_seeds=true to reuse "
+                    "a seed's property instead of creating one. Scores are only comparable to each other: "
+                    "judge a match by its label, domain and range, not by a threshold."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string", "description": "e.g. 'has engine' or 'vehicle has engine'"},
+                        "top_k": {"type": "integer", "description": "Max results (default: 10)"},
+                        "include_seeds": {
+                            "type": "boolean",
+                            "description": "Also search the selected seed ontologies' (seed_select) properties; each result then has a "
+                                           "'seed' field (seed id, null for the active ontology). Default: false",
+                        },
                     },
                     "required": ["query"],
                 },
@@ -411,9 +502,15 @@ def create_server(
                     "Add a triple (subject, property, object) to the ontology. "
                     "Use full URIs for all arguments — never type a URI from memory: get subject/object "
                     "URIs from concept_create/individual_create/concept_search/concept_get output, and get "
-                    "property_uri from property_create/property_search output (or a well-known vocab term). "
-                    "Fails with an error if subject_uri, property_uri, or object_value (as a URI) look like "
-                    "they belong to this ontology but don't exist yet — create the entity first. "
+                    "property_uri from property_create/property_search output, seed_reuse, or the standard "
+                    "vocabularies (rdf, rdfs, owl, skos, xsd). The object of a linking property (owl:sameAs, "
+                    "rdfs:seeAlso, rdfs:isDefinedBy, skos:exactMatch/closeMatch/broadMatch/narrowMatch/"
+                    "relatedMatch) may be any URI, e.g. a Wikidata entity. "
+                    "Fails with an error if subject_uri, property_uri, or object_value (as a URI) is unknown: "
+                    "an entity of this ontology that doesn't exist yet (create it first), a seed term not yet "
+                    "declared (seed_reuse first) or any other external URI. A seed class or property cannot "
+                    "be the subject: its definition belongs to its source ontology — link from the local "
+                    "entity instead (<local> rdfs:subClassOf <seed>). "
                     "Common property URIs: rdfs:subClassOf = http://www.w3.org/2000/01/rdf-schema#subClassOf, "
                     "rdf:type = http://www.w3.org/1999/02/22-rdf-syntax-ns#type. "
                     "Pass source_chunk_id to record which chunk this relation was extracted from — if the "
@@ -544,7 +641,8 @@ def create_server(
                 description=(
                     "Delete a class, individual or property of the ontology entirely: every triple it appears in "
                     "(as subject, property or object), their provenance, its restrictions and the restrictions "
-                    "pointing to it, and its entry in the semantic index. For a wrong or spurious entity only — "
+                    "pointing to it, and its entry in the semantic index. For a reused seed term, removes its "
+                    "declaration and uses from the ontology (the seed is unchanged). For a wrong or spurious entity only — "
                     "to fix one relation use relation_delete, for a duplicate use concept_merge. Irreversible."
                 ),
                 inputSchema={
@@ -576,25 +674,89 @@ def create_server(
                 },
             ),
             types.Tool(
+                name="seed_term_get",
+                description=(
+                    "Look at a seed term as its seed defines it, before reusing it: label, definition, "
+                    "parents, subclasses (subproperties for a property), an individual's classes, a "
+                    "property's domain and range. Use it to check that the term means what you think — "
+                    "a label alone (e.g. '6T') is not enough."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {"uri": {"type": "string", "description": "Seed term URI"}},
+                    "required": ["uri"],
+                },
+            ),
+            types.Tool(
+                name="seed_reuse",
+                description=(
+                    "Reuse a seed term (class, individual or property) in the ontology under its own seed URI, "
+                    "instead of creating an equivalent local one. Copies its minimal declaration (OWL type, "
+                    "labels, definitions, parents, domain/range for a property, rdfs:isDefinedBy its source "
+                    "ontology) and indexes it. Call it when a seed term has exactly the meaning you need, "
+                    "then use its URI like any other (parent_uri, class_uri, domain/range, relation_add). "
+                    "For a narrower meaning, reuse the seed term and create a local subclass of it. A reused "
+                    "term cannot be modified (concept_update, property_update, axioms with it as subject). "
+                    "Idempotent: created=false if already reused; pass source_chunk_id anyway."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "uri": {"type": "string", "description": "Seed term URI, from concept_search / "
+                                                                 "property_search / *_semantic_search with include_seeds=true"},
+                        "source_chunk_id": {"type": "string", "description": "Qdrant point ID of the chunk that motivates the reuse"},
+                    },
+                    "required": ["uri"],
+                },
+            ),
+            types.Tool(
+                name="seed_select",
+                description=(
+                    "Select the seeds this session works with, by id (see seed_list): include_seeds "
+                    "searches, seed_reuse, and ontology_check / ontology_infer / ontology_export with "
+                    "include_seeds then only see these. An empty list selects none. "
+                    "Default (never called): every seed in the store."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "seed_ids": {"type": "array", "items": {"type": "string"},
+                                     "description": "Ids of the seeds to use, e.g. ['fibo-be', 'sustaingraph']"},
+                    },
+                    "required": ["seed_ids"],
+                },
+            ),
+            types.Tool(
                 name="seed_list",
-                description="List all seed ontologies loaded in the store (shared across all ontologies).",
+                description="List all seed ontologies loaded in the store (shared across all ontologies), "
+                            "with whether each is selected for this session (seed_select).",
                 inputSchema={"type": "object", "properties": {}},
             ),
             types.Tool(
                 name="seed_load",
                 description=(
-                    "Load a seed ontology (Turtle format) into the global seed store. "
-                    "Pass either 'url' (HTTP/HTTPS URI) or 'content' (raw Turtle string). "
+                    "Load a seed ontology into the global seed store (graph urn:olaf:seed:{seed_id}) and index "
+                    "its classes, individuals and properties for concept_semantic_search / property_semantic_search. "
+                    "Pass either 'url' (public HTTP/HTTPS URI, at most 200 MB) or 'content' (raw RDF string). "
+                    "Passing the seed_id of an existing seed replaces it; without seed_id, the id derived "
+                    "from the URL must be new. "
                     "Seeds are shared across all ontologies."
                 ),
                 inputSchema={
                     "type": "object",
                     "properties": {
-                        "url": {"type": "string", "description": "HTTP/HTTPS URI of a Turtle ontology to fetch"},
-                        "content": {"type": "string", "description": "Raw Turtle content to load directly"},
-                        "graph_id": {
+                        "url": {"type": "string", "description": "HTTP/HTTPS URI of an RDF ontology to fetch"},
+                        "content": {"type": "string", "description": "Raw RDF content to load directly"},
+                        "seed_id": {
                             "type": "string",
-                            "description": "Named graph URI (auto-generated as urn:olaf:seed:{id} if omitted)",
+                            "description": "Short identifier, e.g. 'foaf' (letters, digits, '_', '-', '.'). "
+                                           "Default: derived from the URL (http://xmlns.com/foaf/0.1/ → 'foaf')",
+                        },
+                        "format": {
+                            "type": "string",
+                            "enum": list(RDF_FORMATS),
+                            "description": "RDF serialization (default: guessed from the response's "
+                                           "Content-Type, the URL's extension or the content; else Turtle)",
                         },
                     },
                 },
@@ -616,7 +778,7 @@ def create_server(
                 inputSchema={
                     "type": "object",
                     "properties": {
-                        "ontology_id": {"type": "string", "description": "Short identifier, e.g. 'legal', 'medical-v2'"},
+                        "ontology_id": {"type": "string", "description": "Short identifier, e.g. 'legal', 'medical-v2' (letters, digits, '_', '-', '.'; not starting with 'seed_')"},
                         "name": {"type": "string", "description": "Human-readable name"},
                         "base_uri": {"type": "string", "description": "Namespace URI (defaults to configured base_uri)"},
                     },
@@ -768,9 +930,18 @@ def create_server(
             ),
         ]
 
-    @server.call_tool()
+    # Input is validated here, after _coerce_arguments, rather than by the MCP library before it.
+    @server.call_tool(validate_input=False)
     async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
         try:
+            if not schemas:
+                schemas.update({t.name: t.inputSchema for t in await list_tools()})
+            arguments = _coerce_arguments(arguments or {}, schemas.get(name))
+            if name in schemas:
+                try:
+                    jsonschema.validate(arguments, schemas[name])
+                except jsonschema.ValidationError as e:
+                    return _err(f"Input validation error: {e.message}")
             oid = session["ontology_id"]
             chunks: ChunkStore = session["chunks"]
             match name:
@@ -824,7 +995,7 @@ def create_server(
                         source_chunk_id=source_chunk_id,
                     )
                     if result["created"] and embed and (warning := _index(lambda: embed.upsert_concept(
-                        result["uri"], arguments["label"], arguments["definition"], source_chunk_id
+                        result["uri"], arguments["label"], arguments["definition"], source_chunk_id, kind="class"
                     ))):
                         result["warning"] = warning
                     return _text(result)
@@ -834,12 +1005,23 @@ def create_server(
                     return _text(result) if result else _err(f"Concept not found: {arguments['uri']}")
 
                 case "concept_search":
-                    return _text(await onto.concept_search_sparql(oid, arguments["query"], arguments.get("top_k", 10)))
+                    return _text(await onto.concept_search_sparql(
+                        oid, arguments["query"], arguments.get("top_k", 10),
+                        include_seeds=arguments.get("include_seeds", False), seed_ids=session["seed_ids"],
+                    ))
 
-                case "concept_semantic_search":
+                case "concept_semantic_search" | "property_semantic_search":
                     if not embed:
                         return _err("Semantic search is disabled (embedding model not loaded)")
-                    return _text(embed.search_concepts(arguments["query"], arguments.get("top_k", 10)))
+                    seed_collections = None
+                    if arguments.get("include_seeds", False):
+                        prefix = _seed_collection_prefix(config)
+                        seed_collections = {c[len(prefix):]: c for c in embed.collections() if c.startswith(prefix)
+                                            and (session["seed_ids"] is None or c[len(prefix):] in session["seed_ids"])}
+                    return _text(embed.search_concepts(
+                        arguments["query"], arguments.get("top_k", 10), seed_collections,
+                        properties=name == "property_semantic_search",
+                    ))
 
                 case "concept_update":
                     await onto.concept_update(
@@ -852,10 +1034,7 @@ def create_server(
                         lang=arguments.get("language", "en"),
                     )
                     if embed and (arguments.get("label") or arguments.get("definition")):
-                        concept = await onto.concept_get(oid, arguments["uri"])
-                        if concept and concept.get("label") and (warning := _index(lambda: embed.upsert_concept(
-                            arguments["uri"], concept["label"], concept.get("definition", "")
-                        ))):
+                        if warning := await _reindex(arguments["uri"]):
                             return _text({"status": "ok", "warning": warning})
                     return _text("ok")
 
@@ -871,7 +1050,8 @@ def create_server(
                         source_chunk_id=source_chunk_id,
                     )
                     if result["created"] and embed and (warning := _index(lambda: embed.upsert_concept(
-                        result["uri"], arguments["label"], arguments.get("definition", ""), source_chunk_id
+                        result["uri"], arguments["label"], arguments.get("definition", ""), source_chunk_id,
+                        kind="individual",
                     ))):
                         result["warning"] = warning
                     return _text(result)
@@ -879,19 +1059,13 @@ def create_server(
                 case "concept_merge":
                     await onto.concept_merge(oid, arguments["keep_uri"], arguments["merge_uri"])
                     if embed:
-                        concept = await onto.concept_get(oid, arguments["keep_uri"])
-
-                        def reindex() -> None:
-                            embed.delete_concept(arguments["merge_uri"])
-                            if concept and concept.get("label"):
-                                embed.upsert_concept(arguments["keep_uri"], concept["label"], concept.get("definition", ""))
-
-                        if warning := _index(reindex):
+                        if warning := (_index(lambda: embed.delete_concept(arguments["merge_uri"]))
+                                       or await _reindex(arguments["keep_uri"])):
                             return _text({"status": "ok", "warning": warning})
                     return _text("ok")
 
                 case "property_create":
-                    return _text(await onto.property_create(
+                    result = await onto.property_create(
                         oid,
                         label=arguments["label"],
                         prop_type=arguments["type"],
@@ -900,7 +1074,10 @@ def create_server(
                         parent_uri=arguments.get("parent_uri"),
                         lang=arguments.get("language", "en"),
                         source_chunk_id=arguments.get("source_chunk_id"),
-                    ))
+                    )
+                    if result["created"] and embed and (warning := await _reindex(result["uri"])):
+                        result["warning"] = warning
+                    return _text(result)
 
                 case "property_update":
                     await onto.property_update(
@@ -910,6 +1087,9 @@ def create_server(
                         range_uri=arguments.get("range_uri"),
                         parent_uri=arguments.get("parent_uri"),
                     )
+                    # domain/range are part of the indexed text
+                    if embed and (warning := await _reindex(arguments["uri"])):
+                        return _text({"status": "ok", "warning": warning})
                     return _text("ok")
 
                 case "property_get":
@@ -917,7 +1097,10 @@ def create_server(
                     return _text(result) if result else _err(f"Property not found: {arguments['uri']}")
 
                 case "property_search":
-                    return _text(await onto.property_search(oid, arguments["query"], arguments.get("top_k", 10)))
+                    return _text(await onto.property_search(
+                        oid, arguments["query"], arguments.get("top_k", 10),
+                        include_seeds=arguments.get("include_seeds", False), seed_ids=session["seed_ids"],
+                    ))
 
                 case "relation_add":
                     await onto.relation_add(
@@ -992,15 +1175,45 @@ def create_server(
                 case "disjoint_add":
                     return _text(await onto.disjoint_add(oid, arguments["class_uris"]))
 
+                case "seed_term_get":
+                    return _text(await onto.seed_term(arguments["uri"], seed_ids=session["seed_ids"]))
+
+                case "seed_reuse":
+                    result = await onto.seed_reuse(oid, arguments["uri"], arguments.get("source_chunk_id"),
+                                                   seed_ids=session["seed_ids"])
+                    if result["created"] and embed and (warning := await _reindex(result["uri"])):
+                        result["warning"] = warning
+                    return _text(result)
+
                 case "seed_list":
-                    return _text(await onto.seed_list())
+                    selected = session["seed_ids"]
+                    return _text([{**s, "selected": selected is None or s["id"] in selected}
+                                  for s in await onto.seed_list()])
+
+                case "seed_select":
+                    known = {s["id"] for s in await onto.seed_list()}
+                    seed_ids = list(dict.fromkeys(arguments["seed_ids"]))
+                    if missing := [i for i in seed_ids if i not in known]:
+                        return _err(f"Unknown seed(s): {', '.join(missing)} (loaded: {', '.join(sorted(known)) or 'none'})")
+                    session["seed_ids"] = seed_ids
+                    return _text({"selected": seed_ids})
 
                 case "seed_load":
-                    return _text(await onto.seed_load(
-                        graph_id=arguments.get("graph_id"),
+                    result = await onto.seed_load(
+                        seed_id=arguments.get("seed_id"),
                         url=arguments.get("url"),
                         content=arguments.get("content"),
-                    ))
+                        fmt=arguments.get("format"),
+                    )
+                    if not embed:
+                        result["warning"] = "Embeddings disabled: seed not indexed for semantic search"
+                    else:
+                        try:
+                            result["indexed_entities"] = await _index_seed(onto, embed, config, result["seed_id"])
+                        except Exception as e:
+                            print(f"Warning: seed not indexed ({e})", file=sys.stderr)
+                            result["warning"] = f"Seed loaded, but not indexed for semantic search: {e}"
+                    return _text(result)
 
                 case "ontology_list":
                     return _text(await onto.ontology_list(oid))
@@ -1018,7 +1231,7 @@ def create_server(
                     session["ontology_id"] = result["active_id"]
                     session["base_uri"] = result["base_uri"]
                     if embed:
-                        embed.switch_collection(f"{config.qdrant.concepts_collection}_{result['active_id']}")
+                        embed.switch_collection(_ontology_collection(config, result['active_id']))
                     return _text(result)
 
                 case "ontology_summary":
@@ -1031,7 +1244,8 @@ def create_server(
                     return _text(summary)
 
                 case "ontology_export":
-                    return _text(await onto.export_ttl(oid, include_seeds=arguments.get("include_seeds", False)))
+                    return _text(await onto.export_ttl(oid, include_seeds=arguments.get("include_seeds", False),
+                                                       seed_ids=session["seed_ids"]))
 
                 case "ontology_orphans":
                     return _text(await onto.orphans(oid, limit=arguments.get("limit", 100)))
@@ -1040,7 +1254,8 @@ def create_server(
                     report: dict[str, Any] = {}
                     if reasoner:
                         try:
-                            data = await onto.reasoner_input(oid, include_seeds=arguments.get("include_seeds", False))
+                            data = await onto.reasoner_input(oid, include_seeds=arguments.get("include_seeds", False),
+                                                             seed_ids=session["seed_ids"])
                             max_explanations = max(1, min(int(arguments.get("max_explanations", 1)), 5))
                             report["reasoner"] = await reasoner.check(data, max_explanations=max_explanations)
                         except Exception as e:
@@ -1066,7 +1281,7 @@ def create_server(
                     if action not in ("preview", "materialize"):
                         return _err(f"Unknown action: {action} (expected preview, materialize or clear)")
                     include_seeds = arguments.get("include_seeds", False)
-                    data = await onto.reasoner_input(oid, include_seeds=include_seeds)
+                    data = await onto.reasoner_input(oid, include_seeds=include_seeds, seed_ids=session["seed_ids"])
                     result = await reasoner.infer(data)
                     if not result["consistent"]:
                         return _err("The ontology is inconsistent, so nothing can be inferred from it: "
@@ -1158,19 +1373,151 @@ async def _make_onto(config: Config) -> OntologyStore:
     return onto
 
 
+def _exit_unless_orphan(qdrant: QdrantClient, collection: str, error: ValueError) -> None:
+    """Nothing to drop in Oxigraph: remove the Qdrant collection if it was left behind,
+    otherwise report the error and exit with a failure status."""
+    if qdrant.collection_exists(collection):
+        qdrant.delete_collection(collection)
+        print(f"{error} Collection Qdrant orpheline '{collection}' supprimée.")
+        return
+    print(f"Erreur : {error}", file=sys.stderr)
+    sys.exit(1)
+
+
 def _cmd_drop(ontology_id: str) -> None:
     async def _inner():
-        onto = await _make_onto(Config.load())
-        result = await onto.drop_ontology(ontology_id)
-        print(f"Ontologie '{result['dropped']}' supprimée.")
+        config = Config.load()
+        onto = await _make_onto(config)
+        qdrant = QdrantClient(url=config.qdrant.url, api_key=config.qdrant.api_key)
+        collection = _ontology_collection(config, ontology_id)
+        try:
+            await onto.drop_ontology(ontology_id)
+        except ValueError as e:
+            _exit_unless_orphan(qdrant, collection, e)
+            return
+        if qdrant.collection_exists(collection):
+            qdrant.delete_collection(collection)
+        print(f"Ontologie '{ontology_id}' supprimée (graphe Oxigraph et collection Qdrant).")
     asyncio.run(_inner())
 
 
 def _cmd_drop_seed(seed_id: str) -> None:
     async def _inner():
-        onto = await _make_onto(Config.load())
-        result = await onto.seed_drop(seed_id)
-        print(f"Seed '{result['dropped']}' supprimée.")
+        config = Config.load()
+        onto = await _make_onto(config)
+        try:
+            seed_graph(seed_id)
+        except ValueError:  # loaded before ids were checked: could not be indexed, no collection
+            try:
+                await onto.seed_drop(seed_id)
+            except ValueError as e:
+                print(f"Erreur : {e}", file=sys.stderr)
+                sys.exit(1)
+            print(f"Seed '{seed_id}' supprimée (graphe Oxigraph).")
+            return
+        qdrant = QdrantClient(url=config.qdrant.url, api_key=config.qdrant.api_key)
+        collection = _seed_collection_prefix(config) + seed_id
+        try:
+            await onto.seed_drop(seed_id)
+        except ValueError as e:
+            _exit_unless_orphan(qdrant, collection, e)
+            return
+        if qdrant.collection_exists(collection):
+            qdrant.delete_collection(collection)
+        print(f"Seed '{seed_id}' supprimée (graphe Oxigraph et collection Qdrant).")
+    asyncio.run(_inner())
+
+
+def _cmd_load_seed(argv: list[str]) -> None:
+    import argparse
+    parser = argparse.ArgumentParser(prog="olaf load-seed")
+    parser.add_argument("source", help="HTTP(S) URL or local file path of the seed ontology")
+    parser.add_argument("--id", dest="seed_id", help="Seed id (default: derived from the URL or file name; must then be new)")
+    parser.add_argument("--format", choices=list(RDF_FORMATS),
+                        help="RDF serialization (default: guessed from Content-Type, extension or content)")
+    parser.add_argument("--no-index", action="store_true", help="Do not index the seed in Qdrant")
+    args = parser.parse_args(argv)
+
+    async def _inner():
+        config = Config.load()
+        onto = await _make_onto(config)
+        if args.source.startswith(("http://", "https://")):
+            result = await onto.seed_load(seed_id=args.seed_id, url=args.source, fmt=args.format,
+                                          allow_private_hosts=True)
+        else:
+            with open(args.source, "rb") as f:
+                data = f.read()
+            result = await onto.seed_load(seed_id=args.seed_id, content=data, fmt=args.format,
+                                          source_name=args.source)
+        print(f"Seed '{result['seed_id']}' chargée dans {result['graph_uri']} "
+              f"({result['triples_loaded']} triplets, {result['format']}).")
+        if args.no_index:
+            return
+        if not config.embedding.enabled:
+            print("Embeddings désactivés dans la config : seed non indexée dans Qdrant.", file=sys.stderr)
+            return
+        qdrant = QdrantClient(url=config.qdrant.url, api_key=config.qdrant.api_key)
+        collection = _seed_collection_prefix(config) + result["seed_id"]
+        embed = EmbeddingService(config.embedding.model, qdrant, collection)
+        count = await _index_seed(onto, embed, config, result["seed_id"])
+        print(f"{count} entité(s) indexé(s) dans la collection Qdrant '{collection}'.")
+    asyncio.run(_inner())
+
+
+def _cmd_reindex(ontology_ids: list[str]) -> None:
+    """Rebuild ontologies' Qdrant collections from Oxigraph (classes, individuals and properties)."""
+    async def _inner():
+        config = Config.load()
+        if not config.embedding.enabled:
+            print("Embeddings désactivés dans la config ([embedding] enabled = false).", file=sys.stderr)
+            sys.exit(1)
+        onto = await _make_onto(config)
+        errors = []
+        for ontology_id in ontology_ids:
+            try:
+                await onto.require_ontology(ontology_id)
+            except ValueError as e:
+                errors.append(str(e))
+        if errors:  # checked before indexing anything, so that no empty collection is created
+            print("Erreur : " + " ".join(errors), file=sys.stderr)
+            sys.exit(1)
+        qdrant = QdrantClient(url=config.qdrant.url, api_key=config.qdrant.api_key)
+        embed = None
+        for ontology_id in ontology_ids:
+            collection = _ontology_collection(config, ontology_id)
+            embed = embed or EmbeddingService(config.embedding.model, qdrant, collection)
+            entities = await onto.ontology_entities(ontology_id)
+            count = await asyncio.to_thread(embed.index_collection, collection, entities)
+            kinds = {k: sum(e["kind"] == k for e in entities) for k in ("class", "individual", "property")}
+            print(f"Ontologie '{ontology_id}' : {count} entité(s) indexée(s) dans '{collection}' "
+                  f"({kinds['class']} classes, {kinds['individual']} individus, {kinds['property']} propriétés).")
+    asyncio.run(_inner())
+
+
+def _cmd_index_seed(seed_ids: list[str]) -> None:
+    """(Re)index seeds already in Oxigraph — all of them if no id is given."""
+    async def _inner():
+        config = Config.load()
+        if not config.embedding.enabled:
+            print("Embeddings désactivés dans la config ([embedding] enabled = false).", file=sys.stderr)
+            sys.exit(1)
+        onto = await _make_onto(config)
+        ids = seed_ids or [s["id"] for s in await onto.seed_list()]
+        qdrant = QdrantClient(url=config.qdrant.url, api_key=config.qdrant.api_key)
+        embed = None
+        failed = False
+        for seed_id in ids:
+            collection = _seed_collection_prefix(config) + seed_id
+            try:
+                await onto.require_seed(seed_id)  # before EmbeddingService, which creates the collection
+                embed = embed or EmbeddingService(config.embedding.model, qdrant, collection)
+                count = await _index_seed(onto, embed, config, seed_id)
+                print(f"Seed '{seed_id}' : {count} entité(s) indexé(s) dans '{collection}'.")
+            except Exception as e:
+                failed = True
+                print(f"Seed '{seed_id}' non indexée : {e}", file=sys.stderr)
+        if failed:
+            sys.exit(1)
     asyncio.run(_inner())
 
 
@@ -1202,6 +1549,15 @@ def main() -> None:
                     print("Usage: olaf drop-seed <seed_id>", file=sys.stderr)
                     sys.exit(1)
                 _cmd_drop_seed(sys.argv[2])
+            case "load-seed":
+                _cmd_load_seed(sys.argv[2:])
+            case "index-seed":
+                _cmd_index_seed(sys.argv[2:])
+            case "reindex":
+                if len(sys.argv) < 3:
+                    print("Usage: olaf reindex <ontology_id> [ontology_id ...]", file=sys.stderr)
+                    sys.exit(1)
+                _cmd_reindex(sys.argv[2:])
             case "reset-chunks":
                 _cmd_reset_chunks(sys.argv[2:])
             case _:

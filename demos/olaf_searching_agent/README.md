@@ -14,7 +14,7 @@ answer   ◀──────┘
 
 For each question the agent runs a tool loop, capped at `max_iterations` rounds:
 
-1. **Locate** the entities in the question with `concept_search` and `concept_semantic_search`, plus `property_search` for relations.
+1. **Locate** the entities in the question with `concept_search` and `concept_semantic_search`, plus `property_search` and `property_semantic_search` for relations.
 2. **Explore** around them with `concept_get` and `relation_search`.
 3. **Query** with `sparql_query` when the question needs lists, counts, joins, hierarchies or paths. The LLM writes the SPARQL; when a query fails or returns nothing, it reads the error and tries a corrected version.
 4. **Ground** the answer by following provenance (`urn:olaf:extractedFrom`) back to the chunks and reading them with `chunk_read_batch`. Triples inferred by the reasoner (materialized by [`olaf_reasoning_agent`](../olaf_reasoning_agent/), marked `<urn:olaf:inferredBy>`) have no source chunk: when an answer rests on one, the agent says it is inferred and cites the chunks of the asserted facts it follows from.
@@ -24,7 +24,7 @@ The conversation is kept between questions, so follow-ups such as "and which of 
 
 ### Read-only access
 
-The agent shows the LLM only the read-only OLAF tools: `chunk_list`, `chunk_read`, `chunk_read_batch`, `concept_list`, `concept_get`, `concept_search`, `concept_semantic_search`, `property_get`, `property_search`, `relation_search`, `relation_sources`, `seed_list`, `ontology_list`, `ontology_summary`, `ontology_export` and `sparql_query`. If the LLM calls any other tool, the agent refuses the call. `sparql_query` refuses updates on its own (only `SELECT` / `ASK` / `CONSTRUCT` / `DESCRIBE`), and Oxigraph's `/query` endpoint cannot run them anyway.
+The agent shows the LLM only the read-only OLAF tools: `chunk_list`, `chunk_read`, `chunk_read_batch`, `concept_list`, `concept_get`, `concept_search`, `concept_semantic_search`, `property_get`, `property_search`, `property_semantic_search`, `relation_search`, `relation_sources`, `seed_list`, `seed_term_get`, `ontology_list`, `ontology_summary`, `ontology_export` and `sparql_query`. If the LLM calls any other tool, the agent refuses the call. `sparql_query` refuses updates on its own (only `SELECT` / `ASK` / `CONSTRUCT` / `DESCRIBE`), and Oxigraph's `/query` endpoint cannot run them anyway.
 
 ## Prerequisites
 
